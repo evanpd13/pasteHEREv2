@@ -4,6 +4,7 @@ Zero-1-to-3 Novel View Synthesis App
 Generates ±30° rotated views from a single image using Stable Zero123.
 """
 
+import argparse
 import os
 import sys
 import tempfile
@@ -14,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import io
 import torch
 import numpy as np
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pathlib import Path
 from rembg import remove
 import gradio as gr
@@ -97,7 +98,11 @@ def remove_background(image: Image.Image) -> Image.Image:
     return output
 
 
-def prepare_for_diffusion(image: Image.Image) -> Image.Image:
+def prepare_for_diffusion(image: Image.Image,
+                          soften_radius: float = 0.5,
+                          contrast: float = 0.95,
+                          color: float = 1.1,
+                          auto_contrast: bool = True) -> Image.Image:
     """
     Prepare image for Zero123 by matching input quality to expected output quality.
     Instead of fighting detail loss, we embrace it - slightly soften the input
@@ -113,15 +118,19 @@ def prepare_for_diffusion(image: Image.Image) -> Image.Image:
 
     # Gentle blur to match diffusion output characteristics
     # This makes the original and generated frames feel cohesive
-    rgb = rgb.filter(ImageFilter.GaussianBlur(radius=0.5))
+    if soften_radius > 0:
+        rgb = rgb.filter(ImageFilter.GaussianBlur(radius=soften_radius))
 
     # Slightly reduce contrast to match diffusion tendency
     enhancer = ImageEnhance.Contrast(rgb)
-    rgb = enhancer.enhance(0.95)
+    rgb = enhancer.enhance(contrast)
 
     # Gentle color boost - diffusion desaturates, so compensate slightly
     enhancer = ImageEnhance.Color(rgb)
-    rgb = enhancer.enhance(1.1)
+    rgb = enhancer.enhance(color)
+
+    if auto_contrast:
+        rgb = ImageOps.autocontrast(rgb, cutoff=1)
 
     # Restore alpha if present
     if alpha:
@@ -131,7 +140,23 @@ def prepare_for_diffusion(image: Image.Image) -> Image.Image:
     return rgb
 
 
-def preprocess_image(image: Image.Image, size: int = 256, input_resolution: int = 512) -> Image.Image:
+def _expand_bbox(bbox: tuple, image_size: tuple, padding_ratio: float) -> tuple:
+    if padding_ratio <= 0:
+        return bbox
+    x0, y0, x1, y1 = bbox
+    width = x1 - x0
+    height = y1 - y0
+    pad_x = int(width * padding_ratio)
+    pad_y = int(height * padding_ratio)
+    new_x0 = max(0, x0 - pad_x)
+    new_y0 = max(0, y0 - pad_y)
+    new_x1 = min(image_size[0], x1 + pad_x)
+    new_y1 = min(image_size[1], y1 + pad_y)
+    return new_x0, new_y0, new_x1, new_y1
+
+
+def preprocess_image(image: Image.Image, size: int = 256, input_resolution: int = 512,
+                     padding_ratio: float = 0.1) -> Image.Image:
     """Preprocess image for Zero123: resize, center, add white background."""
 
     # Early downscale - reduces noise/artifacts and speeds up background removal
@@ -150,7 +175,7 @@ def preprocess_image(image: Image.Image, size: int = 256, input_resolution: int 
     # Get the bounding box of non-transparent pixels
     bbox = image.getbbox()
     if bbox:
-        image = image.crop(bbox)
+        image = image.crop(_expand_bbox(bbox, image.size, padding_ratio))
 
     # Resize while maintaining aspect ratio
     w, h = image.size
@@ -195,17 +220,96 @@ def generate_novel_view(processed_image: Image.Image, azimuth: float, polar: flo
     return result
 
 
+def match_color_statistics(target: Image.Image, reference: Image.Image) -> Image.Image:
+    """Match color statistics of target to reference for consistency."""
+    target_arr = np.asarray(target).astype(np.float32)
+    ref_arr = np.asarray(reference).astype(np.float32)
+
+    for channel in range(3):
+        t = target_arr[..., channel]
+        r = ref_arr[..., channel]
+        t_mean, t_std = t.mean(), t.std()
+        r_mean, r_std = r.mean(), r.std()
+        if t_std < 1e-6:
+            continue
+        t = (t - t_mean) / t_std
+        t = t * r_std + r_mean
+        target_arr[..., channel] = t
+
+    target_arr = np.clip(target_arr, 0, 255).astype(np.uint8)
+    return Image.fromarray(target_arr)
+
+
+def apply_postprocess(image: Image.Image,
+                      reference: Image.Image,
+                      detail_strength: float = 1.0,
+                      color_strength: float = 1.0,
+                      contrast_strength: float = 1.0,
+                      sharpness_strength: float = 1.0,
+                      gamma: float = 1.0,
+                      match_colors: bool = False,
+                      unsharp_radius: float = 1.2) -> Image.Image:
+    """Enhance output with optional detail and color boosts."""
+    output = image
+
+    if match_colors:
+        output = match_color_statistics(output, reference)
+
+    if gamma != 1.0:
+        arr = np.asarray(output).astype(np.float32) / 255.0
+        arr = np.power(arr, gamma)
+        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+        output = Image.fromarray(arr)
+
+    if color_strength != 1.0:
+        output = ImageEnhance.Color(output).enhance(color_strength)
+    if contrast_strength != 1.0:
+        output = ImageEnhance.Contrast(output).enhance(contrast_strength)
+    if sharpness_strength != 1.0:
+        output = ImageEnhance.Sharpness(output).enhance(sharpness_strength)
+
+    if detail_strength != 1.0:
+        percent = int(150 * detail_strength)
+        output = output.filter(ImageFilter.UnsharpMask(radius=unsharp_radius, percent=percent, threshold=2))
+
+    return output
+
+
+def select_scheduler(pipe, scheduler_name: str):
+    """Swap scheduler to try different synthesis behaviors."""
+    from diffusers import DDIMScheduler, EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler
+
+    if scheduler_name == "Euler A (crisper edges)":
+        return EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+    if scheduler_name == "DPM++ 2M (detailed)":
+        return DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    return DDIMScheduler.from_config(pipe.scheduler.config)
+
+
 def generate_rotation_set(image: Image.Image, angle: float = 30,
                           num_steps: int = 75, guidance: float = 3.0,
                           num_frames: int = 3, black_white: bool = False,
-                          input_resolution: int = 512):
+                          input_resolution: int = 512,
+                          padding_ratio: float = 0.1,
+                          scheduler_name: str = "DDIM (balanced)",
+                          detail_strength: float = 1.0,
+                          color_strength: float = 1.0,
+                          contrast_strength: float = 1.0,
+                          sharpness_strength: float = 1.0,
+                          gamma: float = 1.0,
+                          match_colors: bool = False):
     """Generate frames across rotation range from +angle to -angle."""
 
     # Preprocess the image once (removes background)
     print(f"Preprocessing image (input res: {input_resolution}px)...")
-    processed = preprocess_image(image, input_resolution=input_resolution)
+    processed = preprocess_image(
+        image,
+        input_resolution=input_resolution,
+        padding_ratio=padding_ratio
+    )
 
     pipe = load_pipeline()
+    pipe.scheduler = select_scheduler(pipe, scheduler_name)
 
     results = []
 
@@ -238,6 +342,17 @@ def generate_rotation_set(image: Image.Image, angle: float = 30,
         # Convert to black and white if enabled
         if black_white:
             frame = frame.convert("L").convert("RGB")
+
+        frame = apply_postprocess(
+            frame,
+            reference=processed,
+            detail_strength=detail_strength,
+            color_strength=color_strength,
+            contrast_strength=contrast_strength,
+            sharpness_strength=sharpness_strength,
+            gamma=gamma,
+            match_colors=match_colors
+        )
 
         results.append(frame)
 
@@ -292,7 +407,9 @@ def export_images(images: list, output_dir: str, base_name: str = "view"):
 CURRENT_IMAGES = []
 
 
-def process_image(image, angle, num_steps, guidance, num_frames, black_white, boomerang, input_resolution):
+def process_image(image, angle, num_steps, guidance, num_frames, black_white, boomerang, input_resolution,
+                  padding_ratio, scheduler_name, detail_strength, color_strength, contrast_strength,
+                  sharpness_strength, gamma, match_colors):
     """Main processing function for Gradio."""
     global CURRENT_IMAGES
 
@@ -308,7 +425,15 @@ def process_image(image, angle, num_steps, guidance, num_frames, black_white, bo
             guidance=guidance,
             num_frames=int(num_frames),
             black_white=black_white,
-            input_resolution=int(input_resolution)
+            input_resolution=int(input_resolution),
+            padding_ratio=padding_ratio,
+            scheduler_name=scheduler_name,
+            detail_strength=detail_strength,
+            color_strength=color_strength,
+            contrast_strength=contrast_strength,
+            sharpness_strength=sharpness_strength,
+            gamma=gamma,
+            match_colors=match_colors
         )
 
         CURRENT_IMAGES = images
@@ -397,6 +522,45 @@ def create_ui():
                         minimum=256, maximum=1024, value=512, step=128,
                         label="Input Resolution (lower = softer, faster)"
                     )
+                    padding_slider = gr.Slider(
+                        minimum=0.0, maximum=0.3, value=0.1, step=0.05,
+                        label="Subject Padding (more = wider crop)"
+                    )
+                    scheduler_dropdown = gr.Dropdown(
+                        choices=[
+                            "DDIM (balanced)",
+                            "Euler A (crisper edges)",
+                            "DPM++ 2M (detailed)",
+                        ],
+                        value="DDIM (balanced)",
+                        label="Scheduler"
+                    )
+
+                    with gr.Accordion("Enhancements", open=False):
+                        detail_slider = gr.Slider(
+                            minimum=0.8, maximum=1.6, value=1.1, step=0.05,
+                            label="Detail Boost"
+                        )
+                        color_slider = gr.Slider(
+                            minimum=0.8, maximum=1.5, value=1.1, step=0.05,
+                            label="Color Boost"
+                        )
+                        contrast_slider = gr.Slider(
+                            minimum=0.8, maximum=1.3, value=1.05, step=0.05,
+                            label="Contrast Boost"
+                        )
+                        sharpness_slider = gr.Slider(
+                            minimum=0.8, maximum=1.6, value=1.1, step=0.05,
+                            label="Sharpness"
+                        )
+                        gamma_slider = gr.Slider(
+                            minimum=0.8, maximum=1.2, value=1.0, step=0.02,
+                            label="Tone Gamma (lower = brighter)"
+                        )
+                        match_colors_checkbox = gr.Checkbox(
+                            value=True,
+                            label="Match Colors to Input"
+                        )
 
                 generate_btn = gr.Button("Generate Views", variant="primary")
 
@@ -417,7 +581,24 @@ def create_ui():
         # Connect events
         generate_btn.click(
             fn=process_image,
-            inputs=[input_image, angle_slider, steps_slider, guidance_slider, frames_slider, bw_checkbox, boomerang_checkbox, input_res_slider],
+            inputs=[
+                input_image,
+                angle_slider,
+                steps_slider,
+                guidance_slider,
+                frames_slider,
+                bw_checkbox,
+                boomerang_checkbox,
+                input_res_slider,
+                padding_slider,
+                scheduler_dropdown,
+                detail_slider,
+                color_slider,
+                contrast_slider,
+                sharpness_slider,
+                gamma_slider,
+                match_colors_checkbox,
+            ],
             outputs=[gallery, gif_preview, status]
         )
 
@@ -432,6 +613,9 @@ def create_ui():
 
 def main():
     """Main entry point."""
+    parser = argparse.ArgumentParser(description="Zero-1-to-3 Novel View Synthesis App")
+    parser.add_argument("--skip-preload", action="store_true", help="Skip model preload for faster UI startup.")
+    args = parser.parse_args()
     print("=" * 50)
     print("Zero-1-to-3 Novel View Synthesis")
     print("=" * 50)
@@ -439,8 +623,9 @@ def main():
     print("Loading model (this may take a moment)...")
     print("=" * 50)
 
-    # Pre-load the pipeline
-    load_pipeline()
+    # Pre-load the pipeline unless requested to skip
+    if not args.skip_preload:
+        load_pipeline()
 
     print("Starting web UI at http://127.0.0.1:7860")
 
