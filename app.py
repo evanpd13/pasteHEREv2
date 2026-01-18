@@ -20,6 +20,7 @@ import imageio
 import numpy as np
 import torch
 from PIL import Image, ImageEnhance, ImageFilter
+from huggingface_hub import hf_hub_download
 from rembg import remove
 import gradio as gr
 
@@ -39,6 +40,7 @@ print(f"Using device: {DEVICE}")
 # Global pipelines (loaded once per model)
 PIPELINES = {}
 DEFAULT_MODEL_ID = "kxic/stable-zero123"
+MODEL_COMPAT_CACHE = {}
 
 
 @dataclass(frozen=True)
@@ -78,13 +80,7 @@ def load_pipeline(model_id: str = DEFAULT_MODEL_ID):
     scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
     print("  Loading CC projection...")
-    try:
-        cc_projection = CCProjection.from_pretrained(model_id, subfolder="cc_projection")
-    except OSError as exc:
-        raise OSError(
-            "Model is missing the required 'cc_projection' component. "
-            "Please use a Zero123-compatible model repo with a cc_projection/config.json."
-        ) from exc
+    cc_projection = CCProjection.from_pretrained(model_id, subfolder="cc_projection")
 
     # Assemble the pipeline
     PIPELINE = Zero1to3StableDiffusionPipeline(
@@ -112,6 +108,25 @@ def remove_background(image: Image.Image) -> Image.Image:
         image = image.convert("RGBA")
     output = remove(image)
     return output
+
+
+def validate_model_repo(model_id: str) -> Optional[str]:
+    """Validate that a model repo contains Zero123-specific components."""
+    if model_id in MODEL_COMPAT_CACHE:
+        return MODEL_COMPAT_CACHE[model_id]
+
+    try:
+        hf_hub_download(repo_id=model_id, filename="cc_projection/config.json")
+    except Exception:
+        message = (
+            "Model is missing the required 'cc_projection' component. "
+            "Please use a Zero123-compatible model repo with a cc_projection/config.json."
+        )
+        MODEL_COMPAT_CACHE[model_id] = message
+        return message
+
+    MODEL_COMPAT_CACHE[model_id] = None
+    return None
 
 
 def prepare_for_diffusion(
@@ -472,6 +487,10 @@ def process_image(
         selected_model_id = custom_model_value if model_id == "custom" else model_id
         if not selected_model_id:
             return None, None, "Please provide a custom model ID."
+
+        validation_error = validate_model_repo(selected_model_id)
+        if validation_error:
+            return None, None, validation_error
 
         # Generate the rotated views
         enhancement = EnhancementSettings(
