@@ -78,7 +78,13 @@ def load_pipeline(model_id: str = DEFAULT_MODEL_ID):
     scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
 
     print("  Loading CC projection...")
-    cc_projection = CCProjection.from_pretrained(model_id, subfolder="cc_projection")
+    try:
+        cc_projection = CCProjection.from_pretrained(model_id, subfolder="cc_projection")
+    except OSError as exc:
+        raise OSError(
+            "Model is missing the required 'cc_projection' component. "
+            "Please use a Zero123-compatible model repo with a cc_projection/config.json."
+        ) from exc
 
     # Assemble the pipeline
     PIPELINE = Zero1to3StableDiffusionPipeline(
@@ -553,7 +559,6 @@ def create_ui():
                     model_id = gr.Dropdown(
                         choices=[
                             DEFAULT_MODEL_ID,
-                            "ashawkey/zero123-xl-diffusers",
                             "custom",
                         ],
                         value=DEFAULT_MODEL_ID,
@@ -561,7 +566,7 @@ def create_ui():
                     )
                     custom_model_id = gr.Textbox(
                         label="Custom Model ID (used when Model=custom)",
-                        placeholder="org/model-name",
+                        placeholder="org/model-name (must include cc_projection)",
                     )
                     angle_slider = gr.Slider(
                         minimum=10, maximum=60, value=30, step=5,
