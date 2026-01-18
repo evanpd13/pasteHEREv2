@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import io
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
 from pathlib import Path
 from rembg import remove
 import gradio as gr
@@ -97,10 +97,55 @@ def remove_background(image: Image.Image) -> Image.Image:
     return output
 
 
-def preprocess_image(image: Image.Image, size: int = 256) -> Image.Image:
+def prepare_for_diffusion(image: Image.Image) -> Image.Image:
+    """
+    Prepare image for Zero123 by matching input quality to expected output quality.
+    Instead of fighting detail loss, we embrace it - slightly soften the input
+    so the output feels consistent rather than degraded.
+    """
+    # Convert to RGB for processing
+    if image.mode == "RGBA":
+        alpha = image.split()[3]
+        rgb = image.convert("RGB")
+    else:
+        alpha = None
+        rgb = image.convert("RGB")
+
+    # Gentle blur to match diffusion output characteristics
+    # This makes the original and generated frames feel cohesive
+    rgb = rgb.filter(ImageFilter.GaussianBlur(radius=0.5))
+
+    # Slightly reduce contrast to match diffusion tendency
+    enhancer = ImageEnhance.Contrast(rgb)
+    rgb = enhancer.enhance(0.95)
+
+    # Gentle color boost - diffusion desaturates, so compensate slightly
+    enhancer = ImageEnhance.Color(rgb)
+    rgb = enhancer.enhance(1.1)
+
+    # Restore alpha if present
+    if alpha:
+        rgb = rgb.convert("RGBA")
+        rgb.putalpha(alpha)
+
+    return rgb
+
+
+def preprocess_image(image: Image.Image, size: int = 256, input_resolution: int = 512) -> Image.Image:
     """Preprocess image for Zero123: resize, center, add white background."""
-    # Remove background first
+
+    # Early downscale - reduces noise/artifacts and speeds up background removal
+    # Also creates a more "painterly" quality that matches diffusion output
+    w, h = image.size
+    if max(w, h) > input_resolution:
+        scale = input_resolution / max(w, h)
+        image = image.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+
+    # Remove background
     image = remove_background(image)
+
+    # Prepare image to match diffusion output quality
+    image = prepare_for_diffusion(image)
 
     # Get the bounding box of non-transparent pixels
     bbox = image.getbbox()
@@ -109,7 +154,7 @@ def preprocess_image(image: Image.Image, size: int = 256) -> Image.Image:
 
     # Resize while maintaining aspect ratio
     w, h = image.size
-    scale = min(size / w, size / h) * 0.8  # 80% to leave margin
+    scale = min(size / w, size / h) * 0.85  # 85% fill for better detail
     new_w, new_h = int(w * scale), int(h * scale)
     image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
@@ -151,30 +196,36 @@ def generate_novel_view(processed_image: Image.Image, azimuth: float, polar: flo
 
 
 def generate_rotation_set(image: Image.Image, angle: float = 30,
-                          num_steps: int = 75, guidance: float = 3.0):
-    """Generate 3 images: +angle, original (0), -angle rotations."""
+                          num_steps: int = 75, guidance: float = 3.0,
+                          num_frames: int = 3, black_white: bool = False,
+                          input_resolution: int = 512):
+    """Generate frames across rotation range from +angle to -angle."""
 
     # Preprocess the image once (removes background)
-    print("Preprocessing image (removing background)...")
-    processed = preprocess_image(image)
+    print(f"Preprocessing image (input res: {input_resolution}px)...")
+    processed = preprocess_image(image, input_resolution=input_resolution)
 
     pipe = load_pipeline()
 
     results = []
-    # Generate: +angle, 0 (original), -angle
-    angles = [angle, 0, -angle]
+
+    # Generate evenly spaced angles from +angle to -angle
+    if num_frames == 1:
+        angles = [0]
+    else:
+        angles = [angle - (2 * angle * i / (num_frames - 1)) for i in range(num_frames)]
 
     for i, az in enumerate(angles):
-        if az == 0:
+        if abs(az) < 0.01:  # Essentially zero
             # For center image, use the preprocessed version directly
-            results.append(processed)
-            print(f"Using original preprocessed image for azimuth=0°")
+            frame = processed
+            print(f"Frame {i+1}/{num_frames}: Using original (azimuth=0°)")
         else:
-            print(f"Generating view at azimuth={az}°...")
+            print(f"Frame {i+1}/{num_frames}: Generating view at azimuth={az:.1f}°...")
             pose = [0, az, 0.0]  # [polar, azimuth, distance]
 
             with torch.no_grad():
-                result = pipe(
+                frame = pipe(
                     input_imgs=processed,
                     prompt_imgs=processed,
                     poses=[pose],
@@ -183,15 +234,30 @@ def generate_rotation_set(image: Image.Image, angle: float = 30,
                     num_inference_steps=num_steps,
                     guidance_scale=guidance,
                 ).images[0]
-            results.append(result)
+
+        # Convert to black and white if enabled
+        if black_white:
+            frame = frame.convert("L").convert("RGB")
+
+        results.append(frame)
 
     return results
 
 
-def create_gif(images: list, duration: float = 0.5) -> bytes:
+def create_gif(images: list, duration: float = 0.5, boomerang: bool = False) -> bytes:
     """Create a GIF from a list of PIL images."""
     gif_buffer = io.BytesIO()
     frames = [np.array(img) for img in images]
+
+    # Boomerang: start from center (original), go to end, back to start, back to center
+    # For frames [1,2,3] (where 2 is center): becomes [2,3,2,1,2,3,2,1...]
+    # For frames [1,2,3,4,5] (where 3 is center): becomes [3,4,5,4,3,2,1,2,3...]
+    if boomerang and len(frames) >= 3:
+        mid = len(frames) // 2
+        # Start at center, go right to end, back through center to start, back to center
+        # Build: center->end, end->start (skip center), start->center (skip start)
+        frames = frames[mid:] + frames[mid - 1::-1] + frames[1:mid]
+
     imageio.mimsave(gif_buffer, frames, format='GIF', duration=duration, loop=0)
     gif_buffer.seek(0)
     return gif_buffer.getvalue()
@@ -202,11 +268,10 @@ def export_images(images: list, output_dir: str, base_name: str = "view"):
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    labels = ["plus30", "original", "minus30"]
     saved_paths = []
 
-    for img, label in zip(images, labels):
-        filename = f"{base_name}_{label}.png"
+    for i, img in enumerate(images):
+        filename = f"{base_name}_frame_{i:02d}.png"
         filepath = output_path / filename
         img.save(filepath)
         saved_paths.append(str(filepath))
@@ -227,36 +292,39 @@ def export_images(images: list, output_dir: str, base_name: str = "view"):
 CURRENT_IMAGES = []
 
 
-def process_image(image, angle, num_steps, guidance):
+def process_image(image, angle, num_steps, guidance, num_frames, black_white, boomerang, input_resolution):
     """Main processing function for Gradio."""
     global CURRENT_IMAGES
 
     if image is None:
-        return None, None, None, None, "Please upload an image first."
+        return None, None, "Please upload an image first."
 
     try:
-        # Generate the 3 rotated views
+        # Generate the rotated views
         images = generate_rotation_set(
             Image.fromarray(image),
             angle=angle,
             num_steps=int(num_steps),
-            guidance=guidance
+            guidance=guidance,
+            num_frames=int(num_frames),
+            black_white=black_white,
+            input_resolution=int(input_resolution)
         )
 
         CURRENT_IMAGES = images
 
         # Create GIF preview in system temp directory
-        gif_data = create_gif(images, duration=0.5)
+        gif_data = create_gif(images, duration=0.5, boomerang=boomerang)
         gif_path = os.path.join(tempfile.gettempdir(), "preview.gif")
         with open(gif_path, "wb") as f:
             f.write(gif_data)
 
-        return images[0], images[1], images[2], gif_path, "Generation complete!"
+        return images, gif_path, f"Generated {len(images)} frames!"
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return None, None, None, None, f"Error: {str(e)}"
+        return None, None, f"Error: {str(e)}"
 
 
 def do_export(output_dir):
@@ -279,9 +347,21 @@ def do_export(output_dir):
 def create_ui():
     """Create the Gradio interface."""
 
-    with gr.Blocks(title="Zero-1-to-3 Novel View Synthesis") as app:
+    # Clean, modern theme with good contrast
+    theme = gr.themes.Base(
+        primary_hue="blue",
+        secondary_hue="gray",
+    ).set(
+        button_primary_background_fill="#2563eb",
+        button_primary_background_fill_hover="#1d4ed8",
+        button_primary_text_color="white",
+        block_title_text_weight="600",
+        block_label_text_weight="500",
+    )
+
+    with gr.Blocks(title="Zero-1-to-3 Novel View Synthesis", theme=theme) as app:
         gr.Markdown("# Zero-1-to-3 Novel View Synthesis")
-        gr.Markdown("Upload an image to generate ±30° rotated views using Stable Zero123.")
+        gr.Markdown("Upload an image to generate rotated views using Stable Zero123.")
 
         with gr.Row():
             with gr.Column(scale=1):
@@ -293,13 +373,29 @@ def create_ui():
                         minimum=10, maximum=60, value=30, step=5,
                         label="Rotation Angle (±degrees)"
                     )
+                    frames_slider = gr.Slider(
+                        minimum=3, maximum=12, value=3, step=1,
+                        label="Number of Frames"
+                    )
                     steps_slider = gr.Slider(
-                        minimum=25, maximum=100, value=75, step=5,
+                        minimum=25, maximum=100, value=100, step=5,
                         label="Inference Steps (more = better quality)"
                     )
                     guidance_slider = gr.Slider(
-                        minimum=1.0, maximum=10.0, value=3.0, step=0.5,
-                        label="Guidance Scale"
+                        minimum=1.0, maximum=10.0, value=4.0, step=0.5,
+                        label="Guidance Scale (higher = sharper details)"
+                    )
+                    bw_checkbox = gr.Checkbox(
+                        value=False,
+                        label="Black & White"
+                    )
+                    boomerang_checkbox = gr.Checkbox(
+                        value=False,
+                        label="Boomerang (1-2-3-2-1)"
+                    )
+                    input_res_slider = gr.Slider(
+                        minimum=256, maximum=1024, value=512, step=128,
+                        label="Input Resolution (lower = softer, faster)"
                     )
 
                 generate_btn = gr.Button("Generate Views", variant="primary")
@@ -315,18 +411,14 @@ def create_ui():
                 status = gr.Textbox(label="Status", interactive=False)
 
             with gr.Column(scale=2):
-                with gr.Row():
-                    img_plus = gr.Image(label="+30° View", type="pil")
-                    img_center = gr.Image(label="Original (BG Removed)", type="pil")
-                    img_minus = gr.Image(label="-30° View", type="pil")
-
+                gallery = gr.Gallery(label="Generated Frames", columns=4, height="auto")
                 gif_preview = gr.Image(label="GIF Preview", type="filepath")
 
         # Connect events
         generate_btn.click(
             fn=process_image,
-            inputs=[input_image, angle_slider, steps_slider, guidance_slider],
-            outputs=[img_plus, img_center, img_minus, gif_preview, status]
+            inputs=[input_image, angle_slider, steps_slider, guidance_slider, frames_slider, bw_checkbox, boomerang_checkbox, input_res_slider],
+            outputs=[gallery, gif_preview, status]
         )
 
         export_btn.click(
